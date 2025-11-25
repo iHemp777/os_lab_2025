@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <sys/time.h>
 #include <sys/types.h>
@@ -40,24 +41,30 @@ int main(int argc, char **argv) {
         switch (option_index) {
           case 0:
             seed = atoi(optarg);
-            // your code here
-            // error handling
+            if (seed <= 0) {
+              printf("seed must be a positive number\n");
+              return 1;
+            }
             break;
           case 1:
             array_size = atoi(optarg);
-            // your code here
-            // error handling
+            if (array_size <= 0) {
+              printf("array_size must be a positive number\n");
+              return 1;
+            }
             break;
           case 2:
             pnum = atoi(optarg);
-            // your code here
-            // error handling
+            if (pnum <= 0) {
+              printf("pnum must be a positive number\n");
+              return 1;
+            }
             break;
           case 3:
             with_files = true;
             break;
 
-          defalut:
+          default:
             printf("Index %d is out of options\n", option_index);
         }
         break;
@@ -86,11 +93,35 @@ int main(int argc, char **argv) {
 
   int *array = malloc(sizeof(int) * array_size);
   GenerateArray(array, array_size, seed);
+  
+  // Создаем структуры для обмена данными
+  int *pipe_fds = NULL;
+  char **filenames = NULL;
+  
+  if (!with_files) {
+    // Создаем pipe'ы для каждого процесса
+    pipe_fds = malloc(2 * pnum * sizeof(int));
+    for (int i = 0; i < pnum; i++) {
+      if (pipe(pipe_fds + 2*i) == -1) {
+        perror("pipe failed");
+        return 1;
+      }
+    }
+  } else {
+    // Генерируем имена файлов для каждого процесса
+    filenames = malloc(pnum * sizeof(char*));
+    for (int i = 0; i < pnum; i++) {
+      filenames[i] = malloc(20 * sizeof(char));
+      sprintf(filenames[i], "min_max_%d.txt", i);
+    }
+  }
+
   int active_child_processes = 0;
 
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
 
+  // Создаем дочерние процессы
   for (int i = 0; i < pnum; i++) {
     pid_t child_pid = fork();
     if (child_pid >= 0) {
@@ -98,15 +129,40 @@ int main(int argc, char **argv) {
       active_child_processes += 1;
       if (child_pid == 0) {
         // child process
-
-        // parallel somehow
-
+        
+        // Вычисляем границы для текущего процесса
+        int chunk_size = array_size / pnum;
+        int start = i * chunk_size;
+        int end = (i == pnum - 1) ? array_size : (i + 1) * chunk_size;
+        
+        // Ищем min/max в своей части массива
+        struct MinMax local_min_max = GetMinMax(array, start, end);
+        
         if (with_files) {
-          // use files here
+          // Используем файлы для передачи данных
+          FILE *file = fopen(filenames[i], "w");
+          if (file == NULL) {
+            perror("fopen failed");
+            exit(1);
+          }
+          fprintf(file, "%d %d", local_min_max.min, local_min_max.max);
+          fclose(file);
         } else {
-          // use pipe here
+          // Используем pipe для передачи данных
+          close(pipe_fds[2*i]); // закрываем чтение
+          write(pipe_fds[2*i + 1], &local_min_max.min, sizeof(int));
+          write(pipe_fds[2*i + 1], &local_min_max.max, sizeof(int));
+          close(pipe_fds[2*i + 1]);
         }
-        return 0;
+        
+        free(array);
+        if (with_files) {
+          for (int j = 0; j < pnum; j++) free(filenames[j]);
+          free(filenames);
+        } else {
+          free(pipe_fds);
+        }
+        exit(0);
       }
 
     } else {
@@ -115,9 +171,9 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Родительский процесс ждет завершения всех дочерних
   while (active_child_processes > 0) {
-    // your code here
-
+    wait(NULL);
     active_child_processes -= 1;
   }
 
@@ -125,14 +181,28 @@ int main(int argc, char **argv) {
   min_max.min = INT_MAX;
   min_max.max = INT_MIN;
 
+  // Собираем результаты от всех процессов
   for (int i = 0; i < pnum; i++) {
     int min = INT_MAX;
     int max = INT_MIN;
 
     if (with_files) {
-      // read from files
+      // читаем из файлов
+      FILE *file = fopen(filenames[i], "r");
+      if (file == NULL) {
+        perror("fopen failed");
+        return 1;
+      }
+      fscanf(file, "%d %d", &min, &max);
+      fclose(file);
+      // удаляем временный файл
+      remove(filenames[i]);
     } else {
-      // read from pipes
+      // читаем из pipes
+      close(pipe_fds[2*i + 1]); // закрываем запись
+      read(pipe_fds[2*i], &min, sizeof(int));
+      read(pipe_fds[2*i], &max, sizeof(int));
+      close(pipe_fds[2*i]);
     }
 
     if (min < min_max.min) min_max.min = min;
@@ -146,6 +216,12 @@ int main(int argc, char **argv) {
   elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
 
   free(array);
+  if (with_files) {
+    for (int i = 0; i < pnum; i++) free(filenames[i]);
+    free(filenames);
+  } else {
+    free(pipe_fds);
+  }
 
   printf("Min: %d\n", min_max.min);
   printf("Max: %d\n", min_max.max);
